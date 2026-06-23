@@ -238,8 +238,12 @@ class RegisterService:
 
     def _target_reached(self, cfg: dict, submitted: int) -> bool:
         mode = str(cfg.get("mode") or "total")
-        metrics = self._pool_metrics()
-        self._bump(**metrics)
+        try:
+            metrics = self._pool_metrics()
+            self._bump(**metrics)
+        except Exception as exc:
+            self._append_log(f"检查号池失败: {exc}", "red")
+            return False
         if mode == "quota":
             reached = metrics["current_quota"] >= int(cfg.get("target_quota") or 1)
             self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，目标额度={cfg.get('target_quota')}，{'跳过注册' if reached else '继续注册'}", "yellow")
@@ -272,28 +276,43 @@ class RegisterService:
     def _run(self) -> None:
         threads = int(self.get()["threads"])
         submitted, done, success, fail = 0, 0, 0, 0
+        consecutive_errors = 0
+        max_consecutive_errors = 10
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = set()
             while True:
-                cfg = self.get()
-                while self.get()["enabled"] and not self._target_reached(cfg, submitted) and len(futures) < threads:
-                    submitted += 1
-                    futures.add(executor.submit(openai_register.worker, submitted))
-                self._bump(running=len(futures), done=done, success=success, fail=fail)
-                if not futures and (not self.get()["enabled"] or str(cfg.get("mode") or "total") == "total"):
-                    break
-                if not futures:
-                    time.sleep(max(1, int(cfg.get("check_interval") or 5)))
-                    continue
-                finished, futures = wait(futures, return_when=FIRST_COMPLETED)
-                for future in finished:
-                    done += 1
-                    try:
-                        result = future.result()
-                        success += 1 if result.get("ok") else 0
-                        fail += 0 if result.get("ok") else 1
-                    except Exception:
-                        fail += 1
+                try:
+                    cfg = self.get()
+                    if not cfg.get("enabled"):
+                        break
+                    while self.get()["enabled"] and not self._target_reached(cfg, submitted) and len(futures) < threads:
+                        submitted += 1
+                        futures.add(executor.submit(openai_register.worker, submitted))
+                    self._bump(running=len(futures), done=done, success=success, fail=fail)
+                    if not futures and (not self.get()["enabled"] or str(cfg.get("mode") or "total") == "total"):
+                        break
+                    if not futures:
+                        check_interval = max(1, int(cfg.get("check_interval") or 5))
+                        time.sleep(check_interval)
+                        consecutive_errors = 0
+                        continue
+                    finished, futures = wait(futures, return_when=FIRST_COMPLETED)
+                    for future in finished:
+                        done += 1
+                        try:
+                            result = future.result()
+                            success += 1 if result.get("ok") else 0
+                            fail += 0 if result.get("ok") else 1
+                        except Exception:
+                            fail += 1
+                    consecutive_errors = 0
+                except Exception as exc:
+                    consecutive_errors += 1
+                    self._append_log(f"注册机运行异常（{consecutive_errors}/{max_consecutive_errors}）: {exc}", "red")
+                    if consecutive_errors >= max_consecutive_errors:
+                        self._append_log(f"连续 {max_consecutive_errors} 次异常，停止注册机", "red")
+                        break
+                    time.sleep(5)
         self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
         with self._lock:
             self._config["enabled"] = False
