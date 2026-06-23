@@ -714,8 +714,7 @@ class AccountService:
     def _account_payload_token(item: dict) -> str:
         return str(item.get("access_token") or item.get("accessToken") or "").strip()
 
-    @staticmethod
-    def _prepare_account_payload(item: dict) -> dict | None:
+    def _prepare_account_payload(self, item: dict) -> dict | None:
         if not isinstance(item, dict):
             return None
         access_token = AccountService._account_payload_token(item)
